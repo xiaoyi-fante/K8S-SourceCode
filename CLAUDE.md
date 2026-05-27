@@ -272,3 +272,4 @@ kubectl run
 | 文件 | 内容 |
 |------|------|
 | `第02章 创建pod时kubectl的执行流程和它的设计模式.md` | kubectl 执行流程、cobra 命令树、Visitor/Builder 设计模式 |
+| `第03章 apiserver中的权限相关.md` | apiserver 启动三 server 链、Authentication/Authorization/Audit/Admission 四大权限模块源码 |
