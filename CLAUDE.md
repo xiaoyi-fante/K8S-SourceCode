@@ -273,3 +273,5 @@ kubectl run
 |------|------|
 | `第02章 创建pod时kubectl的执行流程和它的设计模式.md` | kubectl 执行流程、cobra 命令树、Visitor/Builder 设计模式 |
 | `第03章 apiserver中的权限相关.md` | apiserver 启动三 server 链、Authentication/Authorization/Audit/Admission 四大权限模块源码 |
+| `第04章 自定义准入控制器，完成nginx sidecar的注入.md` | MutatingAdmissionWebhook 实战：webhook server 架构、JSON Patch 注入、annotation 驱动决策、K8s CSR 证书签名 |
+| `第05章 API核心服务的处理流程.md` | GenericAPIServer.New 构造模板、PostStartHook 三路合并、installAPI 四类路由、Scheme 四张 map、RESTStorage 与 restStorageMap 组装（§01-§02，§03-§05 待整理） |
