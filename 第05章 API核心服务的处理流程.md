@@ -20,6 +20,12 @@
 
 6. **`restStorageMap` 是路由注册的最终数据结构**：`NewLegacyRESTStorage` 将所有资源和子资源的 RESTStorage 以 `"pods"` / `"pods/status"` / `"pods/exec"` 为 key 塞入 `map[string]rest.Storage`，再经 `apiGroupInfo.VersionedResourcesStorageMap["v1"]` 传给 `InstallLegacyAPI` 完成路由注册。
 
+7. **`Strategy.PrepareForCreate` 强制初始化资源状态**：Pod 写入 etcd 前，`BeforeCreate` 回调 `podStrategy.PrepareForCreate`，强制将 `Status.Phase` 设为 `Pending`、计算并写入 `QOSClass`——用户在 YAML 中写的 Status 字段被 apiserver 覆盖，防止客户端伪造状态。
+
+8. **etcd 事务是防并发重复创建的最后屏障**：`etcd3.store.Create` 用 `IF version == 0 THEN PUT` 原子事务写入，version == 0 表示 key 不存在；并发创建同名资源时，只有一个能成功，另一个拿到 `KeyExistsError`。
+
+9. **MaxInFlightLimit 与 APF 互斥，由 `c.FlowControl` 决定**：`DefaultBuildHandlerChain` 中，`FlowControl != nil` 走 APF（优先级队列+FlowSchema），否则走 MaxInFlightLimit（两个 bool channel 信号量）；`system:masters` 组的请求在 MaxInFlightLimit 中无条件放行。
+
 ---
 
 ## 全章调用链总图
@@ -257,7 +263,7 @@ Custom Resources（自定义资源）
     │           └── Verbs：create / delete / deletecollection / get / list / patch / update / watch
     │
     └── External Version（外部版本，面向用户的 YAML/JSON）
-        Internal Version（内部版本，apiserver 内部转换中枢）
+          Internal Version（内部版本，apiserver 内部转换中枢）
 ```
 
 - **Group**：如 `""` (core)、`apps`、`batch`；core group 的 API 路径是 `/api`，其他是 `/apis/<group>`
@@ -442,10 +448,329 @@ type PodStorage struct {
 
 ## §03 apiserver 中 Pod 数据的保存
 
+| 读码目标 | 源文件（可点击） | 入口函数 |
+|---------|----------------|---------|
+| genericregistry.Store.Create | [store.go](kubernetes/staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go) | `Create:362` |
+| DryRun 检查层 | [dryrun.go](kubernetes/staging/src/k8s.io/apiserver/pkg/registry/generic/registry/dryrun.go) | `DryRunnableStorage.Create:36` |
+| etcd3 真正写入 | [store.go](kubernetes/staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go) | `store.Create:143` |
+| Pod 业务校验 | [strategy.go](kubernetes/pkg/registry/core/pod/strategy.go) | `PrepareForCreate:82` |
+| QoS 判定 | [qos.go](kubernetes/pkg/apis/core/helper/qos/qos.go) | `GetPodQOS:37` |
+
+本节从 `genericregistry.Store.Create` 出发，跟踪一个 Pod 创建请求如何经过业务校验、QoS 计算，最终落地到 etcd。
+
+### 总体调用链
+
+```
+REST handler（HTTP POST /api/v1/pods）
+  │
+  ▼ genericregistry.Store.Create           store.go:362
+  │
+  ├── BeginCreate（可选 hook，构造 finishCreate defer）
+  │
+  ├── BeforeCreate → strategy.PrepareForCreate  strategy.go:82
+  │     ├── pod.Status = PodPending           设置初始状态
+  │     ├── podutil.DropDisabledPodFields     去掉 feature gate 未开启的字段
+  │     └── qos.GetPodQOS(pod)               计算 QoS 等级并写入 Status
+  │
+  ├── Storage.Create（DryRunnableStorage）   dryrun.go:36
+  │     ├── DryRun == true → 只做 Get 检查 key 是否已存在，不写入
+  │     └── DryRun == false → s.Storage.Create（真正写入）
+  │           │
+  │           ▼ etcd3.store.Create           etcd3/store.go:143
+  │                 ├── PrepareObjectForStorage（序列化）
+  │                 ├── s.client.KV.Txn（etcd 事务写入）
+  │                 └── 写成功 → 解码返回对象 + 版本号
+  │
+  └── AfterCreate + Decorator（收尾 hook）
+```
+
+### BeforeCreate：业务校验与状态初始化
+
+`BeforeCreate` 是 `genericregistry.Store` 在调用存储层之前统一执行的业务逻辑入口，它回调 `CreateStrategy` 的 `PrepareForCreate`：
+
+```go
+// pkg/registry/core/pod/strategy.go:82
+func (podStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
+    pod := obj.(*api.Pod)
+    pod.Status = api.PodStatus{
+        Phase:    api.PodPending,          // 新建 Pod 初始状态必须是 Pending
+        QOSClass: qos.GetPodQOS(pod),      // 计算 QoS 等级
+    }
+    podutil.DropDisabledPodFields(pod, nil) // 去除 feature gate 关闭的字段
+    applySeccompVersionSkew(pod)
+}
+```
+
+新建 Pod 的 `Status.Phase` 由 apiserver 在此处强制设为 `Pending`，用户在 YAML 中写的 Status 字段会被忽略——这是 apiserver 对资源初始状态的强制管控，防止客户端伪造状态。
+
+### GetPodQOS：QoS 三级判定
+
+Kubernetes 用 QoS 在节点资源紧张时决定杀谁留谁。QoS 等级在 Pod 创建时由 apiserver 计算并写入 `Status.QOSClass`，后续 kubelet 直接读取该字段，不再重算。
+
+判定逻辑（`pkg/apis/core/helper/qos/qos.go:37`）：
+
+```
+遍历所有容器的 Resources.Requests / Resources.Limits
+  │
+  ├── requests == 0 && limits == 0 → BestEffort   （不设任何资源限制）
+  │
+  ├── isGuaranteed（所有容器 requests == limits） → Guaranteed
+  │
+  └── 其他 → Burstable
+```
+
+| QoS 等级 | 触发条件 | OOM 优先级 |
+|---------|---------|-----------|
+| BestEffort | 没有任何 requests/limits | 最先被杀 |
+| Burstable | requests < limits，或只设其中一个 | 中等 |
+| Guaranteed | 所有容器 requests == limits，且均非零 | 最后被杀 |
+
+### DryRunnableStorage：DryRun 语义在存储层的实现
+
+```go
+// staging/src/k8s.io/apiserver/pkg/registry/generic/registry/dryrun.go:36
+func (s *DryRunnableStorage) Create(ctx context.Context, key string,
+        obj, out runtime.Object, ttl uint64, dryRun bool) error {
+    if dryRun {
+        // 只查 etcd 看 key 是否已存在，不写入
+        if err := s.Storage.Get(ctx, key, storage.GetOptions{}, out); err == nil {
+            return storage.NewKeyExistsError(key, 0)
+        }
+        return s.copyInto(obj, out)
+    }
+    return s.Storage.Create(ctx, key, obj, out, ttl)  // 真正写入
+}
+```
+
+`kubectl apply --dry-run=server` 时请求带 `dryRun=All`，apiserver 在此层短路：做完所有 Admission/Validation 之后，到达存储层时只检查 key 冲突、不实际落盘，让调用方获得与真实创建相同的校验反馈。
+
+### etcd3.store.Create：真正的落盘
+
+```go
+// staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go:143
+func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object, ttl uint64) error {
+    // 1. 序列化：将 Go struct 转成 Protobuf/JSON 字节流
+    data, err := runtime.Encode(s.codec, obj)
+
+    // 2. 计算存储 key（加前缀）
+    key = path.Join(s.pathPrefix, key)
+
+    // 3. 获取 TTL（租约）
+    opts, err := s.ttlOpts(ctx, int64(ttl))
+
+    // 4. 序列化元数据 (ResourceVersion = 0，表示 key 必须不存在)
+    metadata, _ := s.transformer.TransformToStorage(data, authenticatedDataString(key))
+
+    startTime := time.Now()
+    // 5. etcd 事务写入：IF version == 0 THEN PUT
+    txnResp, err := s.client.KV.Txn(ctx).If(
+        clientv3.Compare(clientv3.Version(key), "=", 0),
+    ).Then(
+        clientv3.OpPut(key, string(metadata), opts...),
+    ).Commit()
+
+    if !txnResp.Succeeded {
+        return storage.NewKeyExistsError(key, 0)   // key 已存在，并发冲突
+    }
+    // 6. 从响应中解码最终对象（带 ResourceVersion）
+    putResp := txnResp.Responses[0].GetResponsePut()
+    return decode(s.codec, s.versioner, data, out, putResp.Header.Revision)
+}
+```
+
+etcd 事务（`IF version == 0 THEN PUT`）是防并发重复创建的关键：version == 0 意味着 key 不存在，事务原子地检查并写入，失败时返回 `KeyExistsError`。
+
 ---
 
 ## §04 apiserver 中的限流策略源码解读
 
----
+| 读码目标 | 源文件（可点击） | 入口函数 |
+|---------|----------------|---------|
+| 限流 handler 选择 | [config.go](kubernetes/staging/src/k8s.io/apiserver/pkg/server/config.go) | `DefaultBuildHandlerChain:722` |
+| MaxInFlight 实现 | [maxinflight.go](kubernetes/staging/src/k8s.io/apiserver/pkg/server/filters/maxinflight.go) | `WithMaxInFlightLimit:119` |
+| APF hook 注册 | [config.go](kubernetes/staging/src/k8s.io/apiserver/pkg/server/config.go) | `GenericAPIServer.New:662` |
+
+本节覆盖 apiserver 的四种限流机制，重点源码分析 MaxInFlightLimit 的 channel 队列实现，以及 APF（API Priority and Fairness）如何替代它。
+
+### 四种限流机制概览
+
+| 机制 | 粒度 | 特点 |
+|------|------|------|
+| **MaxInFlightLimit** | server 级别整体 | 最简单，分只读/修改两个 channel；v1.21 默认启用 |
+| **Client 限流** | 客户端自身（如 client-go 默认 QPS=5） | 只能由各客户端自己控制，集群管理员无法干预 |
+| **EventRateLimit** | event 请求（1.13+） | 以 Admission Webhook 形式集成在 apiserver 内部，可按用户/namespace/server 分级限制 |
+| **APF**（API Priority and Fairness） | 请求级别，更细粒度 | v1.18 alpha，v1.20 beta；优先级队列 + FlowSchema；取代 MaxInFlightLimit |
+
+### MaxInFlightLimit：channel 队列实现
+
+**接入点**：`DefaultBuildHandlerChain` 中，根据是否启用 APF 选择走哪条限流路径：
+
+```go
+// staging/src/k8s.io/apiserver/pkg/server/config.go:727
+if c.FlowControl != nil {
+    handler = genericfilters.WithPriorityAndFairness(handler, c.LongRunningFunc, c.FlowControl)
+} else {
+    handler = genericfilters.WithMaxInFlightLimit(handler, c.MaxRequestsInFlight,
+        c.MaxMutatingRequestsInFlight, c.LongRunningFunc)
+}
+```
+
+`WithMaxInFlightLimit` 用两个有缓冲 channel 实现信号量：
+
+```go
+// staging/src/k8s.io/apiserver/pkg/server/filters/maxinflight.go:119
+func WithMaxInFlightLimit(handler http.Handler, nonMutatingLimit, mutatingLimit int,
+        longRunningRequestCheck apirequest.LongRunningRequestCheck) http.Handler {
+
+    // limit == 0 表示不限流，直接透传
+    if nonMutatingLimit == 0 && mutatingLimit == 0 {
+        return handler
+    }
+
+    // 构造两个 bool channel，容量 = limit
+    var nonMutatingChan chan bool
+    var mutatingChan chan bool
+    if nonMutatingLimit != 0 {
+        nonMutatingChan = make(chan bool, nonMutatingLimit)   // 只读请求队列
+    }
+    if mutatingLimit != 0 {
+        mutatingChan = make(chan bool, mutatingLimit)          // 写操作请求队列
+    }
+    // ...
+}
+```
+
+请求进入时的判断逻辑：
+
+```
+收到请求
+  │
+  ├── 是 long-running 请求（watch/proxy/debug）→ 直接放行，不占 slot
+  │
+  ├── 判断请求类型：isMutatingRequest = !nonMutatingRequestVerbs.Has(verb)
+  │     ├── 修改请求 → 尝试写入 mutatingChan
+  │     └── 只读请求 → 尝试写入 nonMutatingChan
+  │
+  └── select { case c <- true: ... }
+        ├── 写入成功（有空位）→ 记录 metrics，执行 handler，defer 释放 slot
+        └── default（队列已满）
+              ├── 请求 group 包含 system:masters → 强制放行（cluster-admin 不被限流）
+              └── 否则 → HTTP 429 + Retry-After: 1
+```
+
+`system:masters` 豁免只在队列满时才生效——有空位时所有请求都正常排队；队列满时，apiserver 认为来自 cluster-admin 的请求（如运维操作、紧急修复）不能被拒绝，否则在集群故障时管理员反而无法操作。
+
+**限流参数**（启动参数）：
+- `--max-requests-inflight`：只读请求并发上限（默认 400）
+- `--max-mutating-requests-inflight`：修改请求并发上限（默认 200）
+
+### APF（API Priority and Fairness）
+
+APF 是 MaxInFlightLimit 的升级版，解决后者粒度太粗的问题：所有请求共用一个 channel，一个"坏邻居"可以吃掉全部配额。
+
+APF 的核心设计：
+
+```
+FlowSchema（流量分类规则）
+  │  按 user/group/resource/verb 匹配请求
+  ▼
+PriorityLevelConfiguration（优先级队列）
+  │  每个优先级独立的并发配额 + 队列
+  ▼
+公平队列调度（WFQ）
+  │  同优先级内按 FlowDistinguisher（如 namespace/user）公平分配
+  ▼
+handler.ServeHTTP
+```
+
+- `FlowSchema` + `PriorityLevelConfiguration` 是 CRD 对象，可在运行时动态配置
+- apiserver 启动时写入一批 default namespace 的 FlowSchema（如 `exempt`、`system`、`workload-high` 等）
+- APF hook 在 `GenericAPIServer.New` 中通过 `PostStartHook` 注册（`priority-and-fairness-filter`，config.go:663），server 启动后自动生效
+
+**与 MaxInFlightLimit 的关系**：两者互斥，由 `c.FlowControl != nil` 决定走哪条路；生产环境 v1.20+ 建议启用 APF。
+
 
 ## §05 apiserver 重要对象和功能总结
+
+本节为全章总结。各知识点的详细分析见对应章节，此处仅梳理各模块在整体请求链路中的位置。
+
+### apiserver 的三个 server
+
+| server | 职责 | 路由前缀 |
+|--------|------|---------|
+| apiExtensionsServer | 处理 CRD 请求 | `/apis/<crd-group>/` |
+| kubeAPIServer | 处理内置资源（Pod/Service/Deployment 等） | `/api/v1/`、`/apis/apps/v1/` 等 |
+| aggregatorServer | 聚合外部 APIServer（metrics-server 等） | 代理转发 |
+
+三个 server 均通过 `GenericAPIServer.New` 构造（见 §01），以委托链串联：aggregator → kubeAPI → apiExtensions → notFound。
+
+### 一个请求的完整生命周期
+
+中间件在 `DefaultBuildHandlerChain` 中以包裹方式注册，实际执行顺序与代码顺序相反：
+
+```
+API HTTP Request
+  │
+  ▼ DefaultBuildHandlerChain（中间件层，执行顺序从上到下）
+  │   ├── PanicRecovery / RequestInfo / WaitGroup / Timeout / CORS
+  │   ├── Authentication（身份认证）          config.go:748   见第03章
+  │   ├── Audit（审计）                       config.go:740
+  │   ├── 限流：APF / MaxInFlightLimit        config.go:727   见 §04
+  │   └── Authorization（鉴权）               config.go:724   见第03章
+  │
+  ▼ 路由到对应资源的 RESTStorage handler
+  │   ├── Admission（准入：Mutating → Schema验证 → Validating）  见第03/04章
+  │   └── genericregistry.Store.Create/Update/Delete/Get
+  │         ├── BeforeCreate → Strategy.PrepareForCreate（业务校验）  见 §03
+  │         └── Storage.Create → etcd3.store.Create（落盘）          见 §03
+  │
+  ▼ 返回响应（含 ResourceVersion）
+```
+
+### 核心对象速查
+
+| 对象 | 作用 | 详见 |
+|------|------|------|
+| `GenericAPIServer` | 三个 server 的共同基座，含 handler chain / PostStartHook | §01 |
+| `Scheme` | GVK ↔ Go Type 双向注册表（四张 map） | §02 |
+| `RESTStorage` / `genericregistry.Store` | 每种资源的 CRUD 实现，嵌 etcd 逻辑 | §02 |
+| `restStorageMap` | 路由 key → RESTStorage 的映射，驱动 URL 路由注册 | §02 |
+| `Strategy`（PrepareForCreate 等） | 各资源的业务校验/默认值逻辑，与存储解耦 | §03 |
+| `DryRunnableStorage` | 在存储层实现 `--dry-run=server` 语义 | §03 |
+| `WithMaxInFlightLimit` | channel 信号量限流，v1.21 默认；v1.20+ 可换 APF | §04 |
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

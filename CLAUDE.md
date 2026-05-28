@@ -274,4 +274,5 @@ kubectl run
 | `第02章 创建pod时kubectl的执行流程和它的设计模式.md` | kubectl 执行流程、cobra 命令树、Visitor/Builder 设计模式 |
 | `第03章 apiserver中的权限相关.md` | apiserver 启动三 server 链、Authentication/Authorization/Audit/Admission 四大权限模块源码 |
 | `第04章 自定义准入控制器，完成nginx sidecar的注入.md` | MutatingAdmissionWebhook 实战：webhook server 架构、JSON Patch 注入、annotation 驱动决策、K8s CSR 证书签名 |
-| `第05章 API核心服务的处理流程.md` | GenericAPIServer.New 构造模板、PostStartHook 三路合并、installAPI 四类路由、Scheme 四张 map、RESTStorage 与 restStorageMap 组装（§01-§02，§03-§05 待整理） |
+| `第05章 API核心服务的处理流程.md` | GenericAPIServer.New 构造模板、PostStartHook 三路合并、installAPI 四类路由、Scheme 四张 map、RESTStorage/restStorageMap 组装、Pod 创建写 etcd 全链路（Strategy/DryRun/etcd事务）、MaxInFlightLimit vs APF 限流源码 |
+| `第06章 kube-scheduler 调度pod的流程.md` | cobra 启动链（main→Setup→Run）、clientset 结构、leader election 选主机制（Lease锁/tryAcquireOrRenew乐观锁）、Event 三角色（EventRecorder/EventBroadcaster/Sink）、Informer 四件套（Reflector/DeltaFIFO/Informer/Indexer） |
