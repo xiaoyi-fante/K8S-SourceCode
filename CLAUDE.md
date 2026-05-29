@@ -275,4 +275,4 @@ kubectl run
 | `第03章 apiserver中的权限相关.md` | apiserver 启动三 server 链、Authentication/Authorization/Audit/Admission 四大权限模块源码 |
 | `第04章 自定义准入控制器，完成nginx sidecar的注入.md` | MutatingAdmissionWebhook 实战：webhook server 架构、JSON Patch 注入、annotation 驱动决策、K8s CSR 证书签名 |
 | `第05章 API核心服务的处理流程.md` | GenericAPIServer.New 构造模板、PostStartHook 三路合并、installAPI 四类路由、Scheme 四张 map、RESTStorage/restStorageMap 组装、Pod 创建写 etcd 全链路（Strategy/DryRun/etcd事务）、MaxInFlightLimit vs APF 限流源码 |
-| `第06章 kube-scheduler 调度pod的流程.md` | cobra 启动链（main→Setup→Run）、clientset 结构、leader election 选主机制（Lease锁/tryAcquireOrRenew乐观锁）、Event 三角色（EventRecorder/EventBroadcaster/Sink）、Informer 四件套（Reflector/DeltaFIFO/Informer/Indexer） |
+| `第06章 kube-scheduler 调度pod的流程.md` | cobra 启动链（main→Setup→Run）、clientset 结构、leader election 选主机制（Lease锁/tryAcquireOrRenew乐观锁）、Event 三角色（EventRecorder/EventBroadcaster/Sink）、Informer 四件套（Reflector/DeltaFIFO/Informer/Indexer）、sharedInformerFactory 按类型复用、HandleDeltas 双路径（Indexer+distribute）、SchedulingQueue 三子队列、scheduleOne Assume/Bind 分离、插件化调度框架（Filter/Score/Registry） |
