@@ -593,3 +593,11 @@ func (dswp *desiredStateOfWorldPopulator) processPodVolumes(pod *v1.Pod, ...) {
 ### findAndRemoveDeletedPods — 清理消失 pod 的 volume
 
 对 pod manager 中已不存在的 pod（即 pod 被删除），将其对应的 volume 从 desiredStateOfWorld 中移除。移除前还要确认 containerRuntime 中该 pod 的所有容器确实已终止，避免误删仍在运行中 pod 的 volume 记录。
+
+---
+
+## §07 volumeManager 中的 reconciler 协调器解析
+
+## §08 statusManager 同步 pod 状态
+
+## §09 probeManager 监控 pod 中容器的健康状况
