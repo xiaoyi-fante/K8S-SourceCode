@@ -22,6 +22,12 @@
 
 7. **volumeManager 三子模块**：`volumePluginMgr`（通过 informer 同步 CSI driver 信息）、`desiredStateOfWorldPopulator`（轮询 podManager，把 pod 的 volume 需求写入 desiredStateOfWorld）、`reconciler`（对比 desiredStateOfWorld 与 actualStateOfWorld，执行 attach/detach/mount/unmount 操作）。三者在 `volumeManager.Run` 中异步启动。
 
+8. **reconciler 三步顺序**：`reconcile()` 固定执行 unmountVolumes → mountAttachVolumes → unmountDetachDevices，先卸载不再需要的 volume 再挂载新的，防止同一 volume 被两个 pod 同时持有。kubelet 重启后的 `sync()` 通过扫描 `/var/lib/kubelet/pods` 目录重建 actualStateOfWorld，避免重复 attach 已挂载的 volume。
+
+9. **statusManager 异步双路设计**：`SetPodStatus` 把状态写入容量 1000 的 `podStatusChannel`（写满时跳过），主循环以 select 同时监听 channel（实时）和 10 秒定时器（兜底 `syncBatch`）。真正写 apiserver 在 `syncPod` 中：先 `needsUpdate` 判断，再 GET 当前版本，最后 `PatchPodStatus`。`needsReconcile` 只比对 kubelet 管辖的四个 Condition，避免外部控制器的修改触发无效 patch。
+
+10. **probeManager worker-per-probe 模式**：`AddPod` 为每个容器的每种探针（liveness/readiness/startup）各创建一个独立 goroutine worker，key 为 `{podUID, containerName, probeType}`。`doProbe` 实现"初始延迟 → 连续阈值 → 写 resultsManager → updates channel → syncLoopIteration"的完整闭环；results 的消费者正是 kubelet 主循环，liveness 失败触发重启，readiness 变化更新 Service 后端。
+
 ---
 
 ## 全章调用链总图
@@ -40,20 +46,46 @@ main()                                          // cmd/kubelet/main.go
   │               └─ kl.Run(podCfg.Updates())
   │
   ▼ kubelet.Run()                               // kubelet.go
-  │   ├─ go kl.volumeManager.Run()             // 异步启动 volumeManager
-  │   ├─ go kl.nodeLeaseController.Run()       // 异步启动 lease 心跳
-  │   ├─ go kl.syncNodeStatus()               // 异步启动 NodeStatus 心跳
-  │   └─ kl.syncLoop()                         // kubelet.go:1852
   │
-  ▼ syncLoop() → syncLoopIteration()           // kubelet.go:1926
-  │   └─ case v := <-configCh (kubetypes.ADD)
-  │         └─ handler.HandlePodAdditions()    // kubelet.go:2084
-  │               └─ kl.dispatchWork()         // kubelet.go:2039
-  │                     └─ podWorkers.UpdatePod()  ← 异步
-  │                           └─ managePodLoop()
-  │                                 └─ kl.syncPod()  // kubelet.go:1497
+  ├─ go kl.volumeManager.Run()                 // 异步：volumeManager 三子模块
+  │       ├─ go volumePluginMgr.Run()          //   CSI driver informer 同步
+  │       ├─ go desiredStateOfWorldPopulator.Run()  // 轮询 podManager → desiredStateOfWorld
+  │       └─ go reconciler.Run()               //   对比两张状态表 → attach/mount/unmount
+  │             └─ reconcile()                 //   unmountVolumes → mountAttachVolumes → unmountDetachDevices
+  │             └─ sync()                      //   首次扫 /var/lib/kubelet/pods 重建 actualStateOfWorld
   │
-  ▼ syncPod()
+  ├─ go kl.nodeLeaseController.Run()           // 异步：Lease 轻量心跳（每 10 秒）
+  │
+  ├─ go kl.syncNodeStatus()                    // 异步：NodeStatus 重量心跳（变化+5分钟门槛）
+  │
+  ├─ go kl.statusManager.Start()              // 异步：pod 状态同步到 apiserver
+  │       ├─ case <-podStatusChannel          //   实时（容量 1000，非阻塞写入）
+  │       └─ case <-syncTicker (10s)          //   兜底 syncBatch（遍历 podStatuses 内存缓存）
+  │             └─ syncPod() → PatchPodStatus //   needsUpdate/needsReconcile 过滤后 patch
+  │
+  ├─ kl.probeManager（NewMainKubelet 时初始化，HandlePodAdditions 时 AddPod 启动 worker）
+  │       └─ per-container per-probeType goroutine（go w.run()）
+  │             └─ doProbe()                  //   InitialDelaySeconds → probe() → 阈值 → resultsManager.Set
+  │                   └─ updates chan         //   → syncLoopIteration 消费
+  │
+  └─ kl.syncLoop()                            // kubelet.go:1852
+  │
+  ▼ syncLoop() → syncLoopIteration()          // kubelet.go:1926  六路 select
+  │   ├─ case <-configCh (ADD)
+  │   │     └─ HandlePodAdditions()           // kubelet.go:2084
+  │   │           ├─ podManager.AddPod()
+  │   │           ├─ probeManager.AddPod()    // 为新 pod 启动探针 worker
+  │   │           └─ dispatchWork()           // kubelet.go:2039
+  │   │                 └─ podWorkers.UpdatePod()  ← 异步
+  │   │                       └─ managePodLoop() → syncPod()
+  │   ├─ case <-plegCh                        // PLEG 容器运行时事件
+  │   ├─ case <-syncCh                        // 定时强制同步
+  │   ├─ case <-livenessManager.Updates()     // liveness 失败 → 重启容器
+  │   ├─ case <-readinessManager.Updates()    // readiness 变化 → SetContainerReadiness
+  │   ├─ case <-startupManager.Updates()      // startup 完成 → 解锁 liveness/readiness
+  │   └─ case <-housekeepingCh               // 清理终止的 pod
+  │
+  ▼ syncPod()                                 // kubelet.go:1497
       ├─ 1. generateAPIPodStatus()
       ├─ 2. statusManager.SetPodStatus()
       ├─ 3. os.MkdirAll(pod data dirs)
@@ -75,6 +107,26 @@ main()                                          // cmd/kubelet/main.go
 | 进入主循环 | [server.go](kubernetes/cmd/kubelet/app/server.go) | `startKubelet:1195` |
 | 主循环 | [kubelet.go](kubernetes/pkg/kubelet/kubelet.go) | `syncLoop:1852` |
 | 主循环迭代 | [kubelet.go](kubernetes/pkg/kubelet/kubelet.go) | `syncLoopIteration:1926` |
+
+```
+main()                               // cmd/kubelet/main.go
+  │
+  ▼ cobra.Command.Execute()
+  │
+  ▼ Run()                            // server.go:434
+  │
+  ▼ run()                            // server.go:492
+  │   ├─ NewMainKubelet()            // kubelet.go:344  实例化所有子组件
+  │   └─ RunKubelet()               // server.go:1091
+  │         └─ startKubelet()       // server.go:1195
+  │               └─ go kl.Run()   // 进入主循环，永不退出
+  │
+  ▼ kl.Run() → kl.syncLoop()        // kubelet.go:1852
+  │
+  ▼ syncLoopIteration()             // kubelet.go:1926  六路 select 事件调度
+```
+
+本节覆盖从 `main()` 到 `syncLoopIteration` 的完整启动链。
 
 ### 启动链概览
 
@@ -255,7 +307,7 @@ Lease 在 `NewMainKubelet` 中初始化：
 
 ```go
 // pkg/kubelet/kubelet.go:344（节选）
-klet.nodeLease Controller = lease.NewController(
+klet.nodeLeaseController = lease.NewController(
     klet.clock,
     klet.heartbeatClient,
     string(klet.nodeName),
@@ -598,6 +650,425 @@ func (dswp *desiredStateOfWorldPopulator) processPodVolumes(pod *v1.Pod, ...) {
 
 ## §07 volumeManager 中的 reconciler 协调器解析
 
+| 读码目标 | 源文件（可点击） | 入口函数 |
+|---------|----------------|---------|
+| reconciler Run | [reconciler.go](kubernetes/pkg/kubelet/volumemanager/reconciler/reconciler.go) | `Run:145` |
+| reconciliation 主循环 | [reconciler.go](kubernetes/pkg/kubelet/volumemanager/reconciler/reconciler.go) | `reconciliationLoopFunc:149` |
+| reconcile 三步 | [reconciler.go](kubernetes/pkg/kubelet/volumemanager/reconciler/reconciler.go) | `reconcile:163` |
+| 卸载 volume | [reconciler.go](kubernetes/pkg/kubelet/volumemanager/reconciler/reconciler.go) | `unmountVolumes:180` |
+| 挂载/attach volume | [reconciler.go](kubernetes/pkg/kubelet/volumemanager/reconciler/reconciler.go) | `mountAttachVolumes:202` |
+| 卸载 block 设备 | [reconciler.go](kubernetes/pkg/kubelet/volumemanager/reconciler/reconciler.go) | `unmountDetachDevices:294` |
+| sync（重建实际状态） | [reconciler.go](kubernetes/pkg/kubelet/volumemanager/reconciler/reconciler.go) | `sync:346` |
+| syncStates | [reconciler.go](kubernetes/pkg/kubelet/volumemanager/reconciler/reconciler.go) | `syncStates:385` |
+
+### reconciler.Run → reconcile 三步
+
+```go
+// pkg/kubelet/volumemanager/reconciler/reconciler.go:145
+func (rc *reconciler) Run(stopCh <-chan struct{}) {
+    wait.Until(rc.reconciliationLoopFunc(), rc.loopSleepDuration, stopCh)
+}
+
+// reconciler.go:149
+func (rc *reconciler) reconciliationLoopFunc() func() {
+    return func() {
+        rc.reconcile()
+        // reconcile 之后检查：若 populator 已完成首次填充但 sync 尚未跑过，触发一次 sync
+        // sync 扫磁盘重建 actualStateOfWorld，之后 StatesHasBeenSynced() 永远返回 true
+        if rc.populatorHasAddedPods() && !rc.StatesHasBeenSynced() {
+            klog.InfoS("Reconciler: start to sync state")
+            rc.sync()
+        }
+    }
+}
+
+// reconciler.go:163（节选）
+func (rc *reconciler) reconcile() {
+    // 1. 先卸载不再需要的 volume（防止 pod 重建时新 pod mount 前旧 pod 还占用同一卷）
+    rc.unmountVolumes()
+    // 2. mount 需要的 volume（kubelet 负责 attach，若底层 PVC resize 也在此处理）
+    rc.mountAttachVolumes()
+    // 3. detach/unmount 不再使用的 block 设备
+    rc.unmountDetachDevices()
+}
+```
+
+三步顺序固定：先 unmount 再 mount，确保同一个 volume 不会被两个 pod 同时持有。
+
+### unmountVolumes — 卸载不再需要的 volume
+
+遍历 actualStateOfWorld 中已挂载的 volume，检查是否还在 desiredStateOfWorld 中：
+
+```go
+// reconciler.go:180（节选）
+func (rc *reconciler) unmountVolumes() {
+    for _, mountedVolume := range rc.actualStateOfWorld.GetAllMountedVolumes() {
+        if !rc.desiredStateOfWorld.PodExistsInVolume(mountedVolume.PodName, mountedVolume.VolumeName) {
+            // pod 不再需要这个 volume，执行 unmount
+            err = rc.operationExecutor.UnmountVolume(mountedVolume, rc.actualStateOfWorld, podsDir)
+        }
+    }
+}
+```
+
+`operationExecutor.UnmountVolume` 根据 volume 类型（Filesystem 还是 Block）走不同路径：
+- **Filesystem**：`GenerateUnmountVolumeFunc` → 找插件 → `NewUnmounter` → 清理子目录 → `TearDown`
+- **Block**：`GenerateUnmapVolumeFunc` → 释放文件描述符锁 → 解绑 pod-device 链接 → 解绑 node-device 链接
+
+### mountAttachVolumes — 挂载需要的 volume
+
+遍历 desiredStateOfWorld，对还没有 attach/mount 的 volume 执行操作：
+
+```go
+// reconciler.go:202（节选）
+func (rc *reconciler) mountAttachVolumes() {
+    for _, volumeToMount := range rc.desiredStateOfWorld.GetVolumesToMount() {
+        volMounted, devicePath, err := rc.actualStateOfWorld.PodExistsInVolume(...)
+        if cache.IsVolumeNotAttachedError(err) {
+            // 未 attach，触发 attach（kubelet 负责时）
+            rc.operationExecutor.AttachVolume(volumeToMount, rc.actualStateOfWorld)
+        } else if !volMounted || cache.IsRemountRequiredError(err) {
+            // 未 mount 或需要 remount（PVC resize 场景）
+            rc.operationExecutor.MountVolume(...)
+        }
+    }
+}
+```
+
+### sync — 重建 actualStateOfWorld
+
+kubelet 重启后 actualStateOfWorld 是空的，但节点磁盘上可能已有挂载记录。`sync` 通过扫描 `/var/lib/kubelet/pods` 目录重建实际状态：
+
+```go
+// reconciler.go:346（节选）
+func (rc *reconciler) sync() {
+    defer rc.updateLastSyncTime()
+    rc.syncStates()
+}
+```
+
+`syncStates` 扫描磁盘上每个 pod 的卷目录，比对 desiredStateOfWorld：
+
+- **volume 在 DSW 中存在**：标记为 InUse，交给 `reconcile` re-mount
+- **volume 不在 DSW 中**：调用 `reconstructVolume` 尝试重建，失败则 `cleanupMounts` 清理残留挂载点
+
+这一机制保证 kubelet 重启后不会因为 actualStateOfWorld 为空而重复 attach 已经挂载的 volume。
+
+---
+
 ## §08 statusManager 同步 pod 状态
 
+| 读码目标 | 源文件（可点击） | 入口函数 |
+|---------|----------------|---------|
+| Manager 接口 | [status_manager.go](kubernetes/pkg/kubelet/status/status_manager.go) | `Manager interface:90` |
+| 初始化 | [status_manager.go](kubernetes/pkg/kubelet/status/status_manager.go) | `NewManager:119` |
+| 启动主循环 | [status_manager.go](kubernetes/pkg/kubelet/status/status_manager.go) | `Start:148` |
+| 外部调用入口 | [status_manager.go](kubernetes/pkg/kubelet/status/status_manager.go) | `SetPodStatus:189` |
+| 内部更新逻辑 | [status_manager.go](kubernetes/pkg/kubelet/status/status_manager.go) | `updateStatusInternal:391` |
+| 批量同步 | [status_manager.go](kubernetes/pkg/kubelet/status/status_manager.go) | `syncBatch:502` |
+| 同步单个 pod | [status_manager.go](kubernetes/pkg/kubelet/status/status_manager.go) | `syncPod:549` |
+| 判断是否需要更新 | [status_manager.go](kubernetes/pkg/kubelet/status/status_manager.go) | `needsUpdate:621` |
+| 判断是否可以删除 | [status_manager.go](kubernetes/pkg/kubelet/status/status_manager.go) | `canBeDeleted:633` |
+| 协调判断 | [status_manager.go](kubernetes/pkg/kubelet/status/status_manager.go) | `needsReconcile:649` |
+
+### statusManager 的职责
+
+statusManager **不主动监控** pod 的状态，而是提供接口供其他 manager 调用（`SetPodStatus`、`SetContainerReadiness` 等），内部异步 patch 到 apiserver。它相当于把 podManager 中负责同步 podStatus 的部分单独抽出来，数据结构上仍依赖 podManager。
+
+### Manager 接口
+
+```go
+// pkg/kubelet/status/status_manager.go（节选）
+type Manager interface {
+    PodStatusProvider
+    Start()
+    // syncPod 中调用，设置 pod status，版本+1 后发往 podStatusChannel
+    SetPodStatus(pod *v1.Pod, status v1.PodStatus)
+    SetContainerReadiness(podUID types.UID, containerID kubecontainer.ContainerID, ready bool)
+    SetContainerStartup(podUID types.UID, containerID kubecontainer.ContainerID, started bool)
+    TerminatePod(pod *v1.Pod)
+    RemoveOrphanedStatuses(podUIDs map[types.UID]bool)
+}
+```
+
+### manager 结构体
+
+```go
+// pkg/kubelet/status/status_manager.go（节选）
+type manager struct {
+    kubeClient   clientset.Interface
+    podManager   kubepod.Manager
+    // 内存缓存：UID → versionedPodStatus（含版本号）
+    podStatuses  map[types.UID]versionedPodStatus
+    podStatusesLock sync.RWMutex
+    // 异步队列：容量 1000，写满时 SetPodStatus 走 default 分支跳过，等 syncBatch
+    podStatusChannel chan podStatusSyncRequest
+    apiStatusVersions map[kubetypes.MirrorPodUID]uint64
+    podDeletionSafety PodDeletionSafetyProvider
+}
+```
+
+### Start — 双路 select 主循环
+
+`Start` 以 `go wait.Forever` 运行，监听两个事件：
+
+```go
+// status_manager.go:148（节选）
+func (m *manager) Start() {
+    syncTicker := time.Tick(syncPeriod)  // 默认 10 秒
+    go wait.Forever(func() {
+        for {
+            select {
+            case syncRequest := <-m.podStatusChannel:
+                // 单个 pod status 变化 → 立即 syncPod
+                m.syncPod(syncRequest.podUID, syncRequest.status)
+            case <-syncTicker:
+                // 定时批量同步：遍历内存缓存 podStatuses，捞起 channel 满时被跳过的更新
+                m.syncBatch()
+            }
+        }
+    }, 0)
+}
+```
+
+两条路径互补：`podStatusChannel` 保证实时性，`syncBatch` 兜底处理 channel 满时被跳过的更新。
+
+### SetPodStatus → updateStatusInternal
+
+`syncPod` 中调用 `SetPodStatus`，底层走 `updateStatusInternal`：
+
+```go
+// status_manager.go:391（节选）
+func (m *manager) updateStatusInternal(pod *v1.Pod, status v1.PodStatus, forceUpdate bool) bool {
+    // 1. 从缓存取旧 status（先查 podStatuses，再查 mirrorPod，最后用 pod.Status）
+    var oldStatus v1.PodStatus
+    cachedStatus, isCached := m.podStatuses[pod.UID]
+    if isCached { oldStatus = cachedStatus.status } else { oldStatus = pod.Status }
+
+    // 2. 校验：容器状态不能从 terminated → 非 terminated（非法状态转换）
+    if err := checkContainerStateTransition(oldStatus.ContainerStatuses, status.ContainerStatuses); err != nil {
+        return false
+    }
+    // 3. 更新四个 Condition 的 LastTransitionTime
+    updateLastTransitionTime(&status, &oldStatus, v1.ContainersReady)
+    updateLastTransitionTime(&status, &oldStatus, v1.PodReady)
+    ...
+    // 4. 构建 versionedPodStatus，版本号+1，写入 podStatusChannel（非阻塞）
+    newStatus := versionedPodStatus{status: status, version: cachedStatus.version + 1, ...}
+    m.podStatuses[pod.UID] = newStatus
+    select {
+    case m.podStatusChannel <- podStatusSyncRequest{pod.UID, newStatus}:
+        return true
+    default:
+        // channel 满，跳过；等 syncBatch 下次捞起
+        return false
+    }
+}
+```
+
+### syncPod — 实际 patch 到 apiserver
+
+`syncPod` 是最终写 apiserver 的地方：
+
+1. `needsUpdate` 判断是否需要更新（apiStatusVersions 版本号落后 / podManager 中不存在 / `canBeDeleted` → 都返回 true）
+2. 从 apiserver GET 当前 pod 实例
+3. 翻译 UID（mirror pod → static pod）
+4. 校验 pod 是否刚被重建（UID 不匹配则跳过）
+5. 调用 `statusutil.PatchPodStatus` patch 状态
+6. 若 status 显示 pod 已 terminated 且 `canBeDeleted` 为 true，调用 `kubeClient.CoreV1().Pods().Delete`
+
+`canBeDeleted` 的判断标准（`PodResourcesAreReclaimed`）：pod terminated **且** 所有容器已停止 **且** volume 已清理 **且** cgroup sandbox 已清理。
+
+### needsUpdate vs needsReconcile
+
+| 函数 | 触发时机 | 判断逻辑 |
+|------|----------|---------|
+| `needsUpdate` | `syncBatch` 批量遍历时 | apiStatusVersions 版本号落后 / podManager 中不存在 / `canBeDeleted` |
+| `needsReconcile` | `syncBatch` 内对 updatedStatuses 二次过滤 | 检查 `pod.Status.Conditions` 内容是否与缓存一致（用 `isPodStatusByKubeletEqual`） |
+
+`isPodStatusByKubeletEqual` 只比对 kubelet 管辖的 Condition（`ContainersReady/PodReady/Initialized/PodScheduled`），忽略外部控制器写入的其他 Condition，避免因外部修改触发不必要的 patch。
+
+---
+
 ## §09 probeManager 监控 pod 中容器的健康状况
+
+| 读码目标 | 源文件（可点击） | 入口函数 |
+|---------|----------------|---------|
+| Manager 接口 | [prober_manager.go](kubernetes/pkg/kubelet/prober/prober_manager.go) | `Manager interface:56` |
+| Manager 结构体 | [prober_manager.go](kubernetes/pkg/kubelet/prober/prober_manager.go) | `manager struct:74` |
+| 初始化 | [prober_manager.go](kubernetes/pkg/kubelet/prober/prober_manager.go) | `NewManager:99` |
+| 新增 pod 探针 | [prober_manager.go](kubernetes/pkg/kubelet/prober/prober_manager.go) | `AddPod:153` |
+| 删除 pod 探针 | [prober_manager.go](kubernetes/pkg/kubelet/prober/prober_manager.go) | `RemovePod:199` |
+| worker 初始化 | [worker.go](kubernetes/pkg/kubelet/prober/worker.go) | `newWorker:80` |
+| worker 主循环 | [worker.go](kubernetes/pkg/kubelet/prober/worker.go) | `run:131` |
+| 单次探测逻辑 | [worker.go](kubernetes/pkg/kubelet/prober/worker.go) | `doProbe:180` |
+| prober 初始化 | [prober.go](kubernetes/pkg/kubelet/prober/prober.go) | `newProber:64` |
+| exec 探针实现 | [exec.go](kubernetes/pkg/probe/exec/exec.go) | `Probe:50` |
+| http 探针实现 | [http.go](kubernetes/pkg/probe/http/http.go) | `Probe:72` |
+| tcp 探针实现 | [tcp.go](kubernetes/pkg/probe/tcp/tcp.go) | `Probe:42` |
+
+### 三种探针
+
+| 探针类型 | 作用 | 失败处理 |
+|---------|------|---------|
+| **liveness** | 判断容器是否存活；捕捉死锁等不能自恢复的场景 | kubelet 重启容器 |
+| **readiness** | 判断容器是否可以接收流量；Pod 未就绪时从 Service 负载均衡中摘除 | 不重启，只修改 Ready condition |
+| **startupProbe** | 慢启动容器保护；配置后 liveness/readiness 在 startup 成功前不生效 | startup 失败则 kill 容器，避免启动期误杀 |
+
+探针的探测方法有三种：
+
+| 探测方法 | 成功条件 | 源文件 |
+|---------|---------|--------|
+| **exec** | 命令退出码为 0 | `pkg/probe/exec/exec.go:Probe:50` |
+| **http** | HTTP 响应状态码在 200–399 之间 | `pkg/probe/http/http.go:Probe:72` |
+| **tcp** | 能成功建立 TCP 连接 | `pkg/probe/tcp/tcp.go:Probe:42` |
+
+### proberManager 结构
+
+```go
+// pkg/kubelet/prober/prober_manager.go（节选）
+type manager struct {
+    // 活跃 worker map，key = probeKey{podUID, containerName, probeType}
+    workers   map[probeKey]*worker
+    workerLock sync.RWMutex
+
+    statusManager    status.Manager      // 提供 pod id 和 ip
+    readinessManager results.Manager     // readiness 探活结果缓存
+    livenessManager  results.Manager     // liveness 探活结果缓存
+    startupManager   results.Manager     // startup 探活结果缓存
+    prober           *prober             // 执行者（含 exec/http/tcp 三种实现）
+    start            time.Time
+}
+```
+
+三个 `results.Manager`（`readinessManager`/`livenessManager`/`startupManager`）底层结构相同：`cache map[ContainerID]Result` + `updates chan Update`。`Result` 类型是 int，值为 `Unknown(-1)`、`Success(0)`、`Failure(1)`。
+
+### 初始化
+
+在 `NewMainKubelet` 中初始化：
+
+```go
+// kubelet.go（节选）
+klet.probeManager = prober.NewManager(
+    klet.statusManager,
+    klet.livenessManager,
+    klet.readinessManager,
+    klet.startupManager,
+    klet.runner,
+    kubeDeps.Recorder)
+```
+
+`newProber` 构建三种底层探针实现：
+
+```go
+// prober.go:64（节选）
+func newProber(runner kubecontainer.CommandRunner, recorder record.EventRecorder) *prober {
+    return &prober{
+        exec:          execprobe.New(),
+        readinessHTTP: httpprobe.New(followNonLocalRedirects),
+        livenessHTTP:  httpprobe.New(followNonLocalRedirects),
+        startupHTTP:   httpprobe.New(followNonLocalRedirects),
+        tcp:           tcpprobe.New(),
+        runner:        runner,
+        recorder:      recorder,
+    }
+}
+```
+
+### AddPod — 为每个容器的每种探针创建 worker
+
+kubelet 在 `HandlePodAdditions` 中调用 `kl.probeManager.AddPod(pod)`：
+
+```go
+// prober_manager.go:153（节选）
+func (m *manager) AddPod(pod *v1.Pod) {
+    m.workerLock.Lock()
+    defer m.workerLock.Unlock()
+    key := probeKey{podUID: pod.UID}
+    for _, c := range pod.Spec.Containers {
+        key.containerName = c.Name
+        // 为三种探针各创建一个 worker（若配置了的话）
+        if c.StartupProbe != nil {
+            key.probeType = startup
+            if _, ok := m.workers[key]; ok { continue }  // 已存在则跳过
+            w := newWorker(m, startup, pod, c)
+            m.workers[key] = w
+            go w.run()  // 独立 goroutine 持续探测
+        }
+        if c.ReadinessProbe != nil { ... }
+        if c.LivenessProbe != nil { ... }
+    }
+}
+```
+
+每个 worker 是一个独立 goroutine，key 为 `{podUID, containerName, probeType}`，保证每个容器每种探针只有一个 worker 在运行。
+
+### worker.doProbe — 单次探测核心逻辑
+
+`doProbe` 返回 `keepGoing bool`，false 代表终止 worker：
+
+```go
+// worker.go:180（节选）
+func (w *worker) doProbe() (keepGoing bool) {
+    // 1. pod 不存在或已删除 → 继续保持（等待 GC）
+    status, ok := w.probeManager.statusManager.GetPodStatus(w.pod.UID)
+    if !ok { return true }
+
+    // 2. pod 已 terminated → 终止 worker
+    if status.Phase == v1.PodFailed || status.Phase == v1.PodSucceeded {
+        return false
+    }
+
+    // 3. 容器不存在 → 继续等待
+    c, ok := podutil.GetContainerStatus(status.ContainerStatuses, w.container.Name)
+    if !ok || len(c.ContainerID) == 0 { return true }
+
+    // 4. 容器 ID 变了（重启）→ 更新 containerID，重置 onHold
+    if w.containerID.String() != c.ContainerID {
+        w.containerID = kubecontainer.ParseContainerID(c.ContainerID)
+        w.resultsManager.Remove(w.containerID)
+        w.onHold = false
+    }
+    if w.onHold { return true }  // 容器失败且不重启，等待 GC
+
+    // 5. 容器未运行（启动时间不足 InitialDelaySeconds）→ 跳过
+    if int32(time.Since(c.State.Running.StartedAt.Time).Seconds()) < w.spec.InitialDelaySeconds {
+        return true
+    }
+
+    // 6. 调用 prober.probe 执行实际探测
+    result, err := w.probeManager.prober.probe(w.probeType, w.pod, status, w.container, w.containerID)
+
+    // 7. 更新 metric，判断连续失败/成功次数是否达到阈值
+    if result == results.Failure && w.resultRun < int(w.spec.FailureThreshold) { return true }
+    if result == results.Success && w.resultRun < int(w.spec.SuccessThreshold) { return true }
+
+    // 8. 达到阈值 → 写入 resultsManager
+    w.resultsManager.Set(w.containerID, result, w.pod)
+    return true
+}
+```
+
+### resultsManager.updates → syncLoopIteration 闭环
+
+`resultsManager.Set` 向 `updates chan Update` 写入结果，这个 channel 正是 `syncLoopIteration` 中监听的三个健康检查 channel 之一：
+
+```go
+// syncLoopIteration 中（节选）
+case update := <-kl.livenessManager.Updates():
+    if update.Result == proberesults.Failure {
+        handleProbeSync(kl, update, handler, "liveness", "unhealthy")
+    }
+case update := <-kl.readinessManager.Updates():
+    ready := update.Result == proberesults.Success
+    kl.statusManager.SetContainerReadiness(update.PodUID, update.ContainerID, ready)
+    handleProbeSync(kl, update, handler, "readiness", status)
+case update := <-kl.startupManager.Updates():
+    started := update.Result == proberesults.Success
+    kl.statusManager.SetContainerStartup(update.PodUID, update.ContainerID, started)
+    handleProbeSync(kl, update, handler, "startup", status)
+```
+
+- **liveness 失败**：`handleProbeSync` → `dispatchWork` → 重启容器
+- **readiness 变化**：`SetContainerReadiness` 更新 statusManager，由 Endpoints 控制器决定是否从 Service 摘除
+- **startup 完成**：`SetContainerStartup` 标记启动完成，liveness/readiness 才开始生效
