@@ -704,29 +704,6 @@ handler.ServeHTTP
 
 三个 server 均通过 `GenericAPIServer.New` 构造（见 §01），以委托链串联：aggregator → kubeAPI → apiExtensions → notFound。
 
-### 一个请求的完整生命周期
-
-中间件在 `DefaultBuildHandlerChain` 中以包裹方式注册，实际执行顺序与代码顺序相反：
-
-```
-API HTTP Request
-  │
-  ▼ DefaultBuildHandlerChain（中间件层，执行顺序从上到下）
-  │   ├── PanicRecovery / RequestInfo / WaitGroup / Timeout / CORS
-  │   ├── Authentication（身份认证）          config.go:748   见第03章
-  │   ├── Audit（审计）                       config.go:740
-  │   ├── 限流：APF / MaxInFlightLimit        config.go:727   见 §04
-  │   └── Authorization（鉴权）               config.go:724   见第03章
-  │
-  ▼ 路由到对应资源的 RESTStorage handler
-  │   ├── Admission（准入：Mutating → Schema验证 → Validating）  见第03/04章
-  │   └── genericregistry.Store.Create/Update/Delete/Get
-  │         ├── BeforeCreate → Strategy.PrepareForCreate（业务校验）  见 §03
-  │         └── Storage.Create → etcd3.store.Create（落盘）          见 §03
-  │
-  ▼ 返回响应（含 ResourceVersion）
-```
-
 ### 核心对象速查
 
 | 对象 | 作用 | 详见 |

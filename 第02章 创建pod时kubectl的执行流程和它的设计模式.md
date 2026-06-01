@@ -162,62 +162,6 @@ func main() {
 
 `NewDefaultKubectlCommand()` 在 `staging/src/k8s.io/kubectl/pkg/cmd/` 中定义，它把所有子命令注册到一棵 `cobra.Command` 树上并返回根节点。`command.Execute()` 由 cobra 接管，负责解析命令行字符串、找到匹配的子命令节点、调用其 `Run/RunE` 函数。
 
-### cobra 的三个核心概念
-
-cobra 是 Go 生态中最主流的 CLI 框架（kubectl、hugo、docker 都用它）。它把一条命令拆分为三个部分：
-
-| 概念 | 含义 | 对应 git clone 示例 |
-|------|------|---------------------|
-| **Commands** | 执行动作，即子命令 | `clone`（动作） |
-| **Args** | 位置参数，跟在命令后面 | `https://github.com/spf13/cobra.git`（仓库地址） |
-| **Flags** | 标识符，以 `-` 或 `--` 开头 | `--bare`（创建裸库） |
-
-以 `git clone https://github.com/spf13/cobra.git --bare` 为例：`git` 是可执行文件，`clone` 是 Command，URL 是 Arg，`--bare` 是 Flag。
-
-### cobra.Command 的结构
-
-每个节点是一个 `cobra.Command` 结构体：
-
-```go
-var rootCmd = &cobra.Command{
-    Use:   "my_cobra",                              // 命令名
-    Short: "A brief description of your application",
-    Long:  `A longer description...`,
-    Run: func(cmd *cobra.Command, args []string) {  // 执行函数
-        fmt.Println("my_cobra")
-    },
-}
-```
-
-子命令通过 `rootCmd.AddCommand(subCmd)` 挂载。cobra 路由时，根据用户输入的字符串逐层匹配，找到对应节点后调用其 `Run` 函数：
-
-```
-go run main.go container   →  执行 containerCmd.Run，输出 "container called"
-go run main.go version     →  执行 versionCmd.Run，输出 "my_cobra version is v1.0"
-```
-
-### Flags：persistent 与 local 的区别
-
-flags 按作用范围分两类：
-
-- **persistent**：对当前 Command 及其所有子 Command 生效，适合全局开关（如 `--verbose`）：
-  ```go
-  var Verbose bool
-  rootCmd.PersistentFlags().BoolVarP(&Verbose, "verbose", "v", false, "verbose output")
-  ```
-
-- **local**：只对当前 Command 生效，不向子 Command 传递：
-  ```go
-  var Source string
-  rootCmd.Flags().StringVarP(&Source, "source", "s", "", "Source directory to read from")
-  ```
-
-kubectl 中，`-n`（namespace）等全局标志用 persistent，`-f`（文件）等特定于某个子命令的标志用 local。
-
-### Args：位置参数
-
-以 `ls [OPTION]... [FILE]...` 为例：`OPTION` 对应 flags（以 `-` 开头），`FILE` 对应 arguments（位置参数）。cobra 中称为 Args，规则是参数在所有 flags 之后，`...` 表示可以指定多个。
-
 ---
 
 ## 03. kubectl命令行设置pprof抓取火焰图
@@ -970,36 +914,6 @@ err = r.Visit(func(info *resource.Info, err error) error {
 
 ---
 
-## 08. kubectl功能和对象总结
-
-### kubectl 中的核心对象
-
-**RESTClient**（与 k8s-apiserver 通信的 REST 客户端）：所有子命令最终都通过 `RESTClient` 接口（Get / Post / Patch / Delete / Put）与 API Server 交互，上层不感知底层 HTTP 细节。接口定义见 §05。
-
----
-
-**k8s Object**（Kubernetes 对象）：
-
-Kubernetes 对象是集群状态的持久化记录，描述：
-- 哪些容器化应用在运行（以及在哪些节点上）
-- 可以被应用使用的资源（存储、网络等）
-- 应用的运行策略（重启策略、升级策略、容错策略）
-
-对象一旦创建，Kubernetes 系统就会持续工作以确保对象存在于期望状态（Desired State）。操作对象（创建、修改、删除）必须通过 Kubernetes API。
-
-**Spec 与 Status**：每个对象包含两部分：
-- `spec`：用户期望的状态，由用户定义和维护
-- `status`：对象的实际当前状态，由 Kubernetes 系统持续更新
-
-Kubernetes 的控制循环就是不断让 `status` 趋近于 `spec`。
-
-**yaml 中的必须字段**：
-
-| 字段 | 含义 |
-|------|------|
-| `apiVersion` | 创建对象所使用的 Kubernetes API 版本 |
-| `kind` | 对象的类别（Pod、Deployment 等） |
-| `metadata` | 标识对象的元数据：name（唯一标识）、UID、namespace |
 
 
 

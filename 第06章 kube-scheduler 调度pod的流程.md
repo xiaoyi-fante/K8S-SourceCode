@@ -551,15 +551,6 @@ fwk.EventRecorder().Eventf(pod, nil, v1.EventTypeWarning, "FailedScheduling", "S
 | DeltaFIFO 结构体 | [delta_fifo.go](kubernetes/staging/src/k8s.io/client-go/tools/cache/delta_fifo.go) | `DeltaFIFO:95` |
 | controller 处理循环 | [controller.go](kubernetes/staging/src/k8s.io/client-go/tools/cache/controller.go) | `processLoop:181` |
 
-### 为什么需要 Informer
-
-如果每个 controller 都直接对 apiserver/etcd 发 List+Watch 请求，随着组件数量增加，etcd 连接数和查询压力会成倍增长。Informer 机制的核心价值：
-
-- **实时性**：Watch 而非轮询，事件到达即处理
-- **可靠性**：内置 resync 机制，定期全量同步防止事件丢失
-- **顺序性**：DeltaFIFO 按 key 保证事件顺序处理
-- **解耦**：本地 Indexer 缓存让 controller 的读操作完全不走网络
-
 ### Informer 四件套架构图
 
 ```
